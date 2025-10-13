@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Calendar Confetti",
+  "version": "0.1.0",
+  "description": "Shows a celebratory overlay one minute before your next Google Calendar event.",
+  "permissions": [
+    "identity",
+    "alarms",
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://www.googleapis.com/*",
+    "https://accounts.google.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Calendar Confetti",
+    "default_popup": "src/popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/contentOverlay.js"],
+      "css": ["src/contentOverlay.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "assets/confetti_icon.png",
+    "48": "assets/confetti_icon.png",
+    "128": "assets/confetti_icon.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["assets/*"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "minimum_chrome_version": "114"
+}
