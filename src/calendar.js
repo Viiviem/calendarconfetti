@@ -1,21 +1,26 @@
 import { getAccessToken } from './oauth.js';
 
+// Request only the fields we actually use to minimise data transferred and stored.
+const EVENT_FIELDS = 'items(id,summary,start)';
+
 export async function fetchUpcomingEvents(hoursAhead = 8) {
 	const token = await getAccessToken({ interactive: false });
 	const now = new Date();
-	const timeMin = now.toISOString();
 	const timeMax = new Date(now.getTime() + hoursAhead * 60 * 60 * 1000).toISOString();
+
 	const url = new URL('https://www.googleapis.com/calendar/v3/calendars/primary/events');
 	url.searchParams.set('singleEvents', 'true');
 	url.searchParams.set('orderBy', 'startTime');
-	url.searchParams.set('timeMin', timeMin);
+	url.searchParams.set('timeMin', now.toISOString());
 	url.searchParams.set('timeMax', timeMax);
 	url.searchParams.set('maxResults', '50');
+	url.searchParams.set('showDeleted', 'false');
+	url.searchParams.set('fields', EVENT_FIELDS);
+
 	const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${token}` } });
-	if (!res.ok) throw new Error('Failed to fetch events');
+	if (!res.ok) throw new Error(`Calendar API error: ${res.status}`);
 	const json = await res.json();
-	const events = (json.items || []).map(e => normalizeEvent(e)).filter(Boolean);
-	return events;
+	return (json.items || []).map(normalizeEvent).filter(Boolean);
 }
 
 function normalizeEvent(e) {
@@ -24,19 +29,22 @@ function normalizeEvent(e) {
 	return {
 		id: e.id,
 		summary: e.summary || 'Calendar event',
-		start: new Date(startIso).getTime(),
-		htmlLink: e.htmlLink || ''
+		start: new Date(startIso).getTime()
 	};
 }
 
 export async function scheduleEventAlarms(events) {
-	const alarms = await chrome.alarms.getAll();
-	await Promise.all(alarms.filter(a => a.name.startsWith('event-')).map(a => chrome.alarms.clear(a.name)));
+	// Clear all existing event alarms before rescheduling
+	const existing = await chrome.alarms.getAll();
+	await Promise.all(
+		existing.filter(a => a.name.startsWith('event-')).map(a => chrome.alarms.clear(a.name))
+	);
+
 	const now = Date.now();
 	for (const ev of events) {
-		const triggerTime = ev.start - 60_000;
-		if (triggerTime > now) {
-			await chrome.alarms.create(`event-${ev.id}-${triggerTime}`, { when: triggerTime });
+		const triggerAt = ev.start - 60_000; // one minute before
+		if (triggerAt > now) {
+			await chrome.alarms.create(`event-${ev.id}`, { when: triggerAt });
 		}
 	}
 }
