@@ -1,13 +1,13 @@
-// Minimal OAuth2 with PKCE using chrome.identity.launchWebAuthFlow
+// Minimal OAuth2 with PKCE using chrome.identity.launchWebAuthFlow.
+//
+// Tokens live only in chrome.storage.session (cleared on browser close).
+// We do NOT persist a refresh token to disk: when the access token expires we
+// re-run launchWebAuthFlow with interactive=false, which silently completes if
+// Google still has a session for this user and the scopes were already granted.
 
-// Access token lives in session storage — cleared when the browser closes.
-// Refresh token lives in local storage — persisted so the user stays logged in
-// across browser restarts without needing to re-authenticate interactively.
 const ACCESS_TOKEN_KEY = 'oauth_token';
 const EXPIRY_KEY = 'oauth_expiry';
-const REFRESH_TOKEN_KEY = 'oauth_refresh_token';
 
-// Minimal scope: read-only calendar access only.
 const SCOPES = ['https://www.googleapis.com/auth/calendar.readonly'];
 
 function uint8ArrayToBase64Url(uint8Array) {
@@ -46,7 +46,11 @@ export async function isAuthenticated() {
 	return Date.now() < expiry - 60_000;
 }
 
-export async function getAccessTokenInteractive() {
+// Coalesce concurrent auth attempts so two callers (e.g. background scheduler
+// and the popup) hitting an expired token share a single network round-trip.
+let inflightAuth = null;
+
+async function runAuthFlow(interactive) {
 	const { codeVerifier, codeChallenge } = await generateCodeVerifierAndChallenge();
 	const state = generateState();
 	const clientId = await getClientId();
@@ -57,17 +61,14 @@ export async function getAccessTokenInteractive() {
 	authUrl.searchParams.set('redirect_uri', redirectUri);
 	authUrl.searchParams.set('response_type', 'code');
 	authUrl.searchParams.set('scope', SCOPES.join(' '));
-	authUrl.searchParams.set('access_type', 'offline');
 	authUrl.searchParams.set('code_challenge', codeChallenge);
 	authUrl.searchParams.set('code_challenge_method', 'S256');
 	authUrl.searchParams.set('state', state);
 
-	const responseUrl = await chrome.identity.launchWebAuthFlow({ url: authUrl.toString(), interactive: true });
+	const responseUrl = await chrome.identity.launchWebAuthFlow({ url: authUrl.toString(), interactive });
 	if (!responseUrl) throw new Error('Authorization was cancelled or failed');
 
 	const url = new URL(responseUrl);
-
-	// Verify state parameter to prevent CSRF attacks
 	if (url.searchParams.get('state') !== state) {
 		throw new Error('State mismatch — possible CSRF attack, aborting');
 	}
@@ -90,16 +91,18 @@ export async function getAccessTokenInteractive() {
 	if (!tokenResponse.ok) throw new Error(tokenJson.error_description || tokenJson.error || 'Token exchange failed');
 
 	const expiry = Date.now() + (tokenJson.expires_in || 3600) * 1000;
-
-	// Short-lived access token: session storage only (not persisted to disk)
 	await chrome.storage.session.set({ [ACCESS_TOKEN_KEY]: tokenJson.access_token, [EXPIRY_KEY]: expiry });
-
-	// Long-lived refresh token: local storage so user survives browser restarts
-	if (tokenJson.refresh_token) {
-		await chrome.storage.local.set({ [REFRESH_TOKEN_KEY]: tokenJson.refresh_token });
-	}
-
 	return tokenJson.access_token;
+}
+
+function authFlow(interactive) {
+	if (inflightAuth) return inflightAuth;
+	inflightAuth = runAuthFlow(interactive).finally(() => { inflightAuth = null; });
+	return inflightAuth;
+}
+
+export async function getAccessTokenInteractive() {
+	return authFlow(true);
 }
 
 export async function getAccessToken({ interactive = false } = {}) {
@@ -109,38 +112,33 @@ export async function getAccessToken({ interactive = false } = {}) {
 	});
 	if (token && Date.now() < expiry - 60_000) return token;
 
-	// Try silent refresh using the persisted refresh token
-	const { [REFRESH_TOKEN_KEY]: refreshToken } = await chrome.storage.local.get({ [REFRESH_TOKEN_KEY]: '' });
-	if (refreshToken) {
-		try {
-			const clientId = await getClientId();
-			const res = await fetch('https://oauth2.googleapis.com/token', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-				body: new URLSearchParams({
-					client_id: clientId,
-					grant_type: 'refresh_token',
-					refresh_token: refreshToken
-				}).toString()
-			});
-			const json = await res.json();
-			if (!res.ok) throw new Error(json.error_description || json.error || 'Refresh failed');
-			const newExpiry = Date.now() + (json.expires_in || 3600) * 1000;
-			await chrome.storage.session.set({ [ACCESS_TOKEN_KEY]: json.access_token, [EXPIRY_KEY]: newExpiry });
-			return json.access_token;
-		} catch (e) {
-			console.warn('Token refresh failed:', e.message);
-		}
+	try {
+		return await authFlow(false);
+	} catch (e) {
+		if (interactive) return authFlow(true);
+		throw new Error('Not authenticated');
 	}
+}
 
-	if (interactive) return getAccessTokenInteractive();
-	throw new Error('Not authenticated');
+async function clearEventAlarms() {
+	const alarms = await chrome.alarms.getAll();
+	await Promise.all(alarms.filter(a => a.name.startsWith('event-')).map(a => chrome.alarms.clear(a.name)));
+}
+
+async function revokeToken(token) {
+	try {
+		await fetch('https://oauth2.googleapis.com/revoke?token=' + encodeURIComponent(token), { method: 'POST' });
+	} catch (e) {
+		console.warn('Token revocation failed:', e.message);
+	}
 }
 
 export async function signOut() {
+	const { [ACCESS_TOKEN_KEY]: token } = await chrome.storage.session.get({ [ACCESS_TOKEN_KEY]: '' });
 	await Promise.all([
 		chrome.storage.session.remove([ACCESS_TOKEN_KEY, EXPIRY_KEY]),
-		chrome.storage.local.remove([REFRESH_TOKEN_KEY])
+		clearEventAlarms(),
+		token ? revokeToken(token) : Promise.resolve()
 	]);
 }
 

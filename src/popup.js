@@ -24,6 +24,8 @@ document.getElementById('signin').addEventListener('click', async () => {
 	try {
 		await getAccessTokenInteractive();
 		setStatus('Signed in');
+		// Kick the background to fetch events and schedule alarms now that we have a token.
+		chrome.runtime.sendMessage({ type: 'trigger-fetch-now' }).catch(() => {});
 	} catch (e) {
 		setStatus('Sign in failed: ' + e.message, true);
 	}
